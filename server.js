@@ -36,9 +36,15 @@ function requireAuth(req, res, next) {
   req.user = user;
   next();
 }
-function requireRole(role) {
+function requireProfile(kind) {
+  // kind: 'worker' 또는 'employer'. 계정에 해당 프로필이 없으면 자동으로 만들어줍니다.
+  // (한 번호로 워커/사장님을 둘 다 이용할 수 있도록, "역할"이 아니라 "프로필 보유 여부"로 판단합니다)
   return (req, res, next) => {
-    if (req.user.role !== role) return res.status(403).json({ error: '권한이 없어요.' });
+    const table = kind === 'worker' ? 'worker_profiles' : 'employer_profiles';
+    const exists = db.prepare(`SELECT 1 FROM ${table} WHERE user_id = ?`).get(req.user.id);
+    if (!exists) {
+      db.prepare(`INSERT INTO ${table} (user_id) VALUES (?)`).run(req.user.id);
+    }
     next();
   };
 }
@@ -60,6 +66,8 @@ app.post('/api/auth/request-otp', (req, res) => {
 });
 
 // ---------- 인증: OTP 검증 + 가입/로그인 ----------
+// role은 "이 번호가 영구히 어떤 역할인지"가 아니라, "지금 어떤 화면(WORK/BIZ)으로 들어왔는지"를 나타냅니다.
+// 한 번호로 워커 프로필과 사장님 프로필을 동시에 가질 수 있습니다.
 app.post('/api/auth/verify-otp', (req, res) => {
   const { phone, code, role } = req.body || {};
   if (!phone || !code || !role) return res.status(400).json({ error: '휴대폰 번호, 인증코드, 역할이 모두 필요해요.' });
@@ -70,36 +78,45 @@ app.post('/api/auth/verify-otp', (req, res) => {
 
   let user = db.prepare(`SELECT * FROM users WHERE phone = ?`).get(phone);
   if (!user) {
-    const info = db.prepare(`INSERT INTO users (phone, role) VALUES (?, ?)`).run(phone, role);
+    const info = db.prepare(`INSERT INTO users (phone) VALUES (?)`).run(phone);
     user = db.prepare(`SELECT * FROM users WHERE id = ?`).get(info.lastInsertRowid);
-    if (role === 'worker') {
-      db.prepare(`INSERT INTO worker_profiles (user_id) VALUES (?)`).run(user.id);
-    } else {
-      db.prepare(`INSERT INTO employer_profiles (user_id) VALUES (?)`).run(user.id);
-    }
+  }
+  // 이번에 로그인한 앱(role) 기준 프로필이 없으면 새로 만들어줍니다.
+  const table = role === 'worker' ? 'worker_profiles' : 'employer_profiles';
+  const hasProfile = db.prepare(`SELECT 1 FROM ${table} WHERE user_id = ?`).get(user.id);
+  if (!hasProfile) {
+    db.prepare(`INSERT INTO ${table} (user_id) VALUES (?)`).run(user.id);
   }
 
   const token = randomToken();
   db.prepare(`INSERT INTO sessions (token, user_id) VALUES (?, ?)`).run(token, user.id);
   db.prepare(`DELETE FROM otp_codes WHERE phone = ?`).run(phone);
 
-  res.json({ ok: true, token, user: { id: user.id, phone: user.phone, role: user.role } });
+  const hasWorker = !!db.prepare(`SELECT 1 FROM worker_profiles WHERE user_id = ?`).get(user.id);
+  const hasEmployer = !!db.prepare(`SELECT 1 FROM employer_profiles WHERE user_id = ?`).get(user.id);
+  res.json({ ok: true, token, user: { id: user.id, phone: user.phone, hasWorker, hasEmployer } });
 });
 
 // ---------- 내 정보 ----------
+// ?as=worker 또는 ?as=employer 로 어느 쪽 프로필을 볼지 지정합니다.
 app.get('/api/me', requireAuth, (req, res) => {
+  const as = req.query.as;
+  if (!['worker', 'employer'].includes(as)) {
+    return res.status(400).json({ error: '?as=worker 또는 ?as=employer 쿼리가 필요해요.' });
+  }
   const user = req.user;
-  if (user.role === 'worker') {
+  if (as === 'worker') {
     const profile = db.prepare(`SELECT * FROM worker_profiles WHERE user_id = ?`).get(user.id);
-    return res.json({ ...user, profile: { ...profile, tasks: JSON.parse(profile.tasks || '[]') } });
+    if (!profile) return res.json({ id: user.id, phone: user.phone, profile: null });
+    return res.json({ id: user.id, phone: user.phone, profile: { ...profile, tasks: JSON.parse(profile.tasks || '[]') } });
   } else {
     const profile = db.prepare(`SELECT * FROM employer_profiles WHERE user_id = ?`).get(user.id);
-    return res.json({ ...user, profile });
+    return res.json({ id: user.id, phone: user.phone, profile: profile || null });
   }
 });
 
 // 워커 프로필 저장 (직종, 가능시간 등)
-app.put('/api/me/worker-profile', requireAuth, requireRole('worker'), (req, res) => {
+app.put('/api/me/worker-profile', requireAuth, requireProfile('worker'), (req, res) => {
   const { name, age, tasks, avail_time } = req.body || {};
   db.prepare(`UPDATE worker_profiles SET
       name = COALESCE(?, name),
@@ -112,7 +129,7 @@ app.put('/api/me/worker-profile', requireAuth, requireRole('worker'), (req, res)
 });
 
 // 기업 프로필 저장
-app.put('/api/me/employer-profile', requireAuth, requireRole('employer'), (req, res) => {
+app.put('/api/me/employer-profile', requireAuth, requireProfile('employer'), (req, res) => {
   const { company_name, manager_name, business_no, industry } = req.body || {};
   db.prepare(`UPDATE employer_profiles SET
       company_name = COALESCE(?, company_name),
@@ -125,7 +142,7 @@ app.put('/api/me/employer-profile', requireAuth, requireRole('employer'), (req, 
 });
 
 // ---------- 공고 (BIZ 전용 등록/조회) ----------
-app.post('/api/jobs', requireAuth, requireRole('employer'), (req, res) => {
+app.post('/api/jobs', requireAuth, requireProfile('employer'), (req, res) => {
   const { tasks, location, work_date, start_time, end_time, wage } = req.body || {};
   if (!tasks || !Array.isArray(tasks) || tasks.length === 0 || !work_date || !start_time || !end_time || !wage) {
     return res.status(400).json({ error: '직종(1개 이상), 근무일, 시작/종료시간, 시급은 필수예요.' });
@@ -139,7 +156,7 @@ app.post('/api/jobs', requireAuth, requireRole('employer'), (req, res) => {
 });
 
 // 내(기업) 공고 목록
-app.get('/api/jobs/mine', requireAuth, requireRole('employer'), (req, res) => {
+app.get('/api/jobs/mine', requireAuth, requireProfile('employer'), (req, res) => {
   const jobs = db.prepare(`SELECT * FROM jobs WHERE employer_id = ? ORDER BY created_at DESC`).all(req.user.id);
   const withCounts = jobs.map(j => ({
     ...j,
@@ -150,7 +167,7 @@ app.get('/api/jobs/mine', requireAuth, requireRole('employer'), (req, res) => {
 });
 
 // 공고 마감/재오픈
-app.patch('/api/jobs/:id/status', requireAuth, requireRole('employer'), (req, res) => {
+app.patch('/api/jobs/:id/status', requireAuth, requireProfile('employer'), (req, res) => {
   const { status } = req.body || {};
   if (!['open', 'closed'].includes(status)) return res.status(400).json({ error: 'status는 open 또는 closed' });
   const job = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
@@ -160,7 +177,7 @@ app.patch('/api/jobs/:id/status', requireAuth, requireRole('employer'), (req, re
 });
 
 // 열려있는 공고 목록 (워커 전용, 내 조건 기준 매칭 점수 포함)
-app.get('/api/jobs/open', requireAuth, requireRole('worker'), (req, res) => {
+app.get('/api/jobs/open', requireAuth, requireProfile('worker'), (req, res) => {
   const profile = db.prepare(`SELECT * FROM worker_profiles WHERE user_id = ?`).get(req.user.id);
   const workerTasks = JSON.parse(profile.tasks || '[]');
   const jobs = db.prepare(`
@@ -178,7 +195,7 @@ app.get('/api/jobs/open', requireAuth, requireRole('worker'), (req, res) => {
 });
 
 // ---------- 지원 (워커 -> 공고) ----------
-app.post('/api/jobs/:id/apply', requireAuth, requireRole('worker'), (req, res) => {
+app.post('/api/jobs/:id/apply', requireAuth, requireProfile('worker'), (req, res) => {
   const job = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
   if (!job || job.status !== 'open') return res.status(404).json({ error: '지원할 수 없는 공고예요.' });
 
@@ -198,7 +215,7 @@ app.post('/api/jobs/:id/apply', requireAuth, requireRole('worker'), (req, res) =
 });
 
 // 내(워커) 지원 목록
-app.get('/api/applications/mine', requireAuth, requireRole('worker'), (req, res) => {
+app.get('/api/applications/mine', requireAuth, requireProfile('worker'), (req, res) => {
   const rows = db.prepare(`
     SELECT a.*, j.tasks, j.location, j.work_date, j.start_time, j.end_time, j.wage, e.company_name
     FROM applications a
@@ -209,7 +226,7 @@ app.get('/api/applications/mine', requireAuth, requireRole('worker'), (req, res)
 });
 
 // 특정 공고의 지원자 목록 (기업, 본인 공고만 조회 가능)
-app.get('/api/jobs/:id/applicants', requireAuth, requireRole('employer'), (req, res) => {
+app.get('/api/jobs/:id/applicants', requireAuth, requireProfile('employer'), (req, res) => {
   const job = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(req.params.id);
   if (!job || job.employer_id !== req.user.id) return res.status(404).json({ error: '공고를 찾을 수 없어요.' });
 
@@ -224,7 +241,7 @@ app.get('/api/jobs/:id/applicants', requireAuth, requireRole('employer'), (req, 
 });
 
 // 지원자 선택/거절 (기업)
-app.patch('/api/applications/:id/status', requireAuth, requireRole('employer'), (req, res) => {
+app.patch('/api/applications/:id/status', requireAuth, requireProfile('employer'), (req, res) => {
   const { status } = req.body || {};
   if (!['accepted', 'rejected'].includes(status)) return res.status(400).json({ error: 'status는 accepted 또는 rejected' });
 

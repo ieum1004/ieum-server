@@ -11,7 +11,6 @@ db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   phone TEXT UNIQUE NOT NULL,
-  role TEXT NOT NULL CHECK(role IN ('worker','employer')),
   created_at TEXT DEFAULT (datetime('now'))
 );
 
