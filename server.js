@@ -126,16 +126,16 @@ app.put('/api/me/employer-profile', requireAuth, requireRole('employer'), (req, 
 
 // ---------- 공고 (BIZ 전용 등록/조회) ----------
 app.post('/api/jobs', requireAuth, requireRole('employer'), (req, res) => {
-  const { task, location, work_date, start_time, end_time, wage } = req.body || {};
-  if (!task || !work_date || !start_time || !end_time || !wage) {
-    return res.status(400).json({ error: '직종, 근무일, 시작/종료시간, 시급은 필수예요.' });
+  const { tasks, location, work_date, start_time, end_time, wage } = req.body || {};
+  if (!tasks || !Array.isArray(tasks) || tasks.length === 0 || !work_date || !start_time || !end_time || !wage) {
+    return res.status(400).json({ error: '직종(1개 이상), 근무일, 시작/종료시간, 시급은 필수예요.' });
   }
   const qrToken = crypto.randomBytes(12).toString('hex');
-  const info = db.prepare(`INSERT INTO jobs (employer_id, task, location, work_date, start_time, end_time, wage, qr_token)
+  const info = db.prepare(`INSERT INTO jobs (employer_id, tasks, location, work_date, start_time, end_time, wage, qr_token)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(req.user.id, task, location || '', work_date, start_time, end_time, wage, qrToken);
+    .run(req.user.id, JSON.stringify(tasks), location || '', work_date, start_time, end_time, wage, qrToken);
   const job = db.prepare(`SELECT * FROM jobs WHERE id = ?`).get(info.lastInsertRowid);
-  res.json({ ok: true, job });
+  res.json({ ok: true, job: { ...job, tasks: JSON.parse(job.tasks) } });
 });
 
 // 내(기업) 공고 목록
@@ -143,6 +143,7 @@ app.get('/api/jobs/mine', requireAuth, requireRole('employer'), (req, res) => {
   const jobs = db.prepare(`SELECT * FROM jobs WHERE employer_id = ? ORDER BY created_at DESC`).all(req.user.id);
   const withCounts = jobs.map(j => ({
     ...j,
+    tasks: JSON.parse(j.tasks || '[]'),
     applicant_count: db.prepare(`SELECT COUNT(*) c FROM applications WHERE job_id = ? AND status != 'cancelled'`).get(j.id).c
   }));
   res.json({ jobs: withCounts });
@@ -168,8 +169,9 @@ app.get('/api/jobs/open', requireAuth, requireRole('worker'), (req, res) => {
     WHERE j.status = 'open' ORDER BY j.created_at DESC`).all();
 
   const scored = jobs.map(j => {
-    const { score, reasons } = computeMatchScore(workerTasks, profile.avail_time, j);
-    return { ...j, match_score: score, match_reasons: reasons };
+    const jobParsed = { ...j, tasks: JSON.parse(j.tasks || '[]') };
+    const { score, reasons } = computeMatchScore(workerTasks, profile.avail_time, jobParsed);
+    return { ...jobParsed, match_score: score, match_reasons: reasons };
   }).sort((a, b) => b.match_score - a.match_score);
 
   res.json({ jobs: scored });
@@ -182,7 +184,8 @@ app.post('/api/jobs/:id/apply', requireAuth, requireRole('worker'), (req, res) =
 
   const profile = db.prepare(`SELECT * FROM worker_profiles WHERE user_id = ?`).get(req.user.id);
   const workerTasks = JSON.parse(profile.tasks || '[]');
-  const { score } = computeMatchScore(workerTasks, profile.avail_time, job);
+  const jobParsed = { ...job, tasks: JSON.parse(job.tasks || '[]') };
+  const { score } = computeMatchScore(workerTasks, profile.avail_time, jobParsed);
 
   try {
     const info = db.prepare(`INSERT INTO applications (job_id, worker_id, match_score) VALUES (?, ?, ?)`)
@@ -197,12 +200,12 @@ app.post('/api/jobs/:id/apply', requireAuth, requireRole('worker'), (req, res) =
 // 내(워커) 지원 목록
 app.get('/api/applications/mine', requireAuth, requireRole('worker'), (req, res) => {
   const rows = db.prepare(`
-    SELECT a.*, j.task, j.location, j.work_date, j.start_time, j.end_time, j.wage, e.company_name
+    SELECT a.*, j.tasks, j.location, j.work_date, j.start_time, j.end_time, j.wage, e.company_name
     FROM applications a
     JOIN jobs j ON j.id = a.job_id
     JOIN employer_profiles e ON e.user_id = j.employer_id
     WHERE a.worker_id = ? ORDER BY a.created_at DESC`).all(req.user.id);
-  res.json({ applications: rows });
+  res.json({ applications: rows.map(r => ({ ...r, tasks: JSON.parse(r.tasks || '[]') })) });
 });
 
 // 특정 공고의 지원자 목록 (기업, 본인 공고만 조회 가능)
@@ -217,7 +220,7 @@ app.get('/api/jobs/:id/applicants', requireAuth, requireRole('employer'), (req, 
     WHERE a.job_id = ? AND a.status != 'cancelled'
     ORDER BY a.match_score DESC`).all(job.id);
 
-  res.json({ applicants: rows.map(r => ({ ...r, tasks: JSON.parse(r.tasks || '[]') })) });
+  res.json({ job: { ...job, tasks: JSON.parse(job.tasks || '[]') }, applicants: rows.map(r => ({ ...r, tasks: JSON.parse(r.tasks || '[]') })) });
 });
 
 // 지원자 선택/거절 (기업)

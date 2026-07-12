@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS employer_profiles (
 CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   employer_id INTEGER NOT NULL REFERENCES users(id),
-  task TEXT NOT NULL,             -- 단일 직종 (예: "사무보조")
+  tasks TEXT NOT NULL,             -- JSON array, 예: ["사무보조","전화응대"]
   location TEXT,
   work_date TEXT,                 -- YYYY-MM-DD
   start_time TEXT,                -- HH:MM
