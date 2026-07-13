@@ -3,8 +3,14 @@
 
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 
-const db = new Database(path.join(__dirname, 'ieum.db'));
+// Render에 영구 디스크(/var/data)를 연결해두면 그 경로에 저장해서
+// 재배포/재시작을 해도 데이터가 사라지지 않습니다.
+// 영구 디스크가 없으면(로컬 개발 등) 기존처럼 프로젝트 폴더에 저장합니다.
+const DATA_DIR = fs.existsSync('/var/data') ? '/var/data' : __dirname;
+const db = new Database(path.join(DATA_DIR, 'ieum.db'));
+console.log('DB 저장 위치:', path.join(DATA_DIR, 'ieum.db'));
 db.pragma('journal_mode = WAL');
 
 db.exec(`
